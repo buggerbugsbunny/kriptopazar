@@ -11,54 +11,63 @@ const Crypto = require('../models/Crypto');
 const Order = require('../models/Order');
 const adminBot = require('../adminBot');
 
-// ****** YENİ EKLENDİ (Sunucu Taraflı Fiyat Önbelleği) ******
-let priceCache = {
-    rates: null, // CoinGecko'dan gelen ham 'rates' objesini saklar (api_id bazlı)
-    lastFetched: 0
-};
-// Fiyatları 5 dakika (300 saniye) boyunca önbellekte tut (GÜNCELLENDİ)
-const CACHE_DURATION_MS = 5 * 60 * 1000; 
+// ****** YENİ EKLENDİ (Kalıcı Veritabanı Önbelleği) ******
+const PriceCache = require('../models/PriceCache'); // Yeni modeli import et
 
-// Fiyatları getiren/önbellekten çeken yardımcı fonksiyon
+// Fiyatları 10 dakika boyunca veritabanı önbelleğinde tut
+const DB_CACHE_DURATION_MS = 10 * 60 * 1000; 
+
+// Fiyatları getiren/önbellekten çeken YENİ yardımcı fonksiyon
 async function getFreshPrices() {
     const now = Date.now();
-    
-    // 1. Önbellek geçerliyse, önbellekten dön
-    if (priceCache.rates && (now - priceCache.lastFetched < CACHE_DURATION_MS)) {
-        console.log("... Fiyatlar (getFreshPrices) önbellekten alındı.");
-        return priceCache.rates;
-    }
+    const cacheId = 'all_prices'; // Her zaman bu dökümanı arayacağız
 
-    // 2. Önbellek geçerli değilse, CoinGecko'dan çek
-    console.log("... Fiyatlar (getFreshPrices) CoinGecko'dan çekiliyor.");
     try {
+        // 1. Önbelleği veritabanından kontrol et
+        const cache = await PriceCache.findById(cacheId);
+
+        // 2. Önbellek varsa VE 10 dakikadan yeniyse, veritabanından dön
+        if (cache && (now - new Date(cache.updatedAt).getTime() < DB_CACHE_DURATION_MS)) {
+            console.log("... Fiyatlar (getFreshPrices) Veritabanı Önbelleğinden alındı.");
+            return cache.rates; // Kayıtlı 'rates' objesini döndür
+        }
+
+        // 3. Önbellek yoksa VEYA 10 dakikadan eskiyse, CoinGecko'dan çek
+        console.log("... Fiyatlar (getFreshPrices) CoinGecko'dan çekiliyor (Veritabanı güncellenecek).");
+        
         const cryptos = await Crypto.find().lean();
         if (!cryptos || cryptos.length === 0) {
-             priceCache = { rates: {}, lastFetched: now };
-             return priceCache.rates;
+             return {}; // Çekilecek kripto yoksa boş dön
         }
         
         const apiIds = cryptos.map(c => c.api_id).join(',');
         const response = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${apiIds}&vs_currencies=try`);
         
-        // Ham 'rates' objesini (api_id bazlı) önbelleğe al
-        priceCache = { rates: response.data, lastFetched: now };
-        return priceCache.rates;
+        const newRates = response.data;
+
+        // 4. Yeni fiyatları veritabanına kaydet (veya güncelle)
+        await PriceCache.findByIdAndUpdate(
+            cacheId, 
+            { rates: newRates }, 
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+        
+        console.log("... Veritabanı önbelleği güncellendi.");
+        return newRates;
 
     } catch (err) {
-        // Hata mesajını logla (zaten yapılıyor)
         console.error("!!! Fiyat çekme (getFreshPrices) hatası:", err.message);
-        
         // Hata durumunda, eski önbellek varsa onu kullanarak sitenin çökmesini engelle
-        if (priceCache.rates) {
-            console.warn("   -> Fiyat çekilemedi, eski (stale) önbellek sunuluyor.");
-            return priceCache.rates; 
+        const cache = await PriceCache.findById(cacheId);
+        if (cache && cache.rates) {
+            console.warn("   -> Fiyat çekilemedi, eski (stale) veritabanı önbelleği sunuluyor.");
+            return cache.rates; 
         }
-        // İlk açılışta hata olursa boş obje döndür
+        // Hiçbir şey yoksa boş obje döndür
         return {};
     }
 }
-// ****** /YENİ EKLENDİ ******
+// ****** /GÜNCELLENEN BÖLÜM SONU ******
 
 
 const verifyToken = (req, res, next) => {
@@ -75,14 +84,13 @@ const verifyToken = (req, res, next) => {
 
 router.get('/', (req, res) => { res.render('index'); });
 
-// ****** GÜNCELLENDİ (Önbellek Kullanımı) ******
+// (Bu rota artık veritabanı önbellekli 'getFreshPrices' fonksiyonunu kullanıyor)
 router.get('/api/prices', verifyToken, async (req, res) => {
     try {
         // 1. Önbellekli yardımcı fonksiyondan ham 'rates' (api_id bazlı) verisini al
         const rates = await getFreshPrices(); 
 
         // 2. 'rates' verisini 'symbol' bazlı 'priceMap'e dönüştür (shop.ejs'nin beklediği format)
-        // (Bu DB çağrısı hızlıdır, API çağrısından kaçınmak daha önemlidir)
         const cryptos = await Crypto.find().lean(); 
         const priceMap = {};
         
@@ -98,7 +106,7 @@ router.get('/api/prices', verifyToken, async (req, res) => {
         res.status(500).json({ error: 'Fiyatlar alınamadı.' }); 
     }
 });
-// ****** /GÜNCELLENDİ ******
+
 
 router.get('/shop', verifyToken, async (req, res) => {
     try {
@@ -129,15 +137,13 @@ router.get('/checkout', verifyToken, async (req, res) => {
     }
 });
 
-// ****** GÜNCELLENDİ (POST /checkout - Önbellek Kullanımı) ******
+// (Bu rota artık veritabanı önbellekli 'getFreshPrices' fonksiyonunu kullanıyor)
 router.post('/checkout', verifyToken, async (req, res) => {
     console.log("--- POST /checkout isteği alındı:", req.body);
     try {
-        // paymentInfo (riskli) kaldırıldı, transactionId (TxID) eklendi
         const { productId, quantity, note, selectedCryptoId, transactionId } = req.body;
         const numQuantity = parseInt(quantity);
         
-        // TxID için katı regex kaldırıldı, sadece varlığı kontrol ediliyor.
         if (!productId || !mongoose.Types.ObjectId.isValid(productId) ||
             !numQuantity || numQuantity <= 0 ||
             !selectedCryptoId ||
@@ -152,7 +158,6 @@ router.post('/checkout', verifyToken, async (req, res) => {
         if (!product) { return res.status(404).json({ success: false, message: 'Ürün bulunamadı.' }); }
         if (!product.inStock) { return res.status(400).json({ success: false, message: 'Bu ürün stokta yok.' }); }
         
-        // Seçilen kripto paranın bu ürün için geçerli olup olmadığını kontrol et
         const selectedCrypto = product.availableCryptos.find(crypto => crypto._id.toString() === selectedCryptoId);
         if (!selectedCrypto) { 
             return res.status(400).json({ success: false, message: 'Bu ödeme yöntemi bu ürün için geçerli değil.' }); 
@@ -161,23 +166,18 @@ router.post('/checkout', verifyToken, async (req, res) => {
         // --- GÜVENLİK İYİLEŞTİRMESİ: Sunucu Tarafında Fiyat Hesaplama (Önbellekli) ---
         let calculatedPaymentInfo;
         try {
-            // ESKİ axios.get KULLANIMI KALDIRILDI
-            // const response = await axios.get(`...`);
-            
             // YENİ: Önbellekli yardımcı fonksiyondan ham 'rates' (api_id bazlı) verisini al
             const allRates = await getFreshPrices();
             
             if (!allRates[selectedCrypto.api_id] || !allRates[selectedCrypto.api_id].try) {
-                 throw new Error(`Anlık kur bilgisi (Önbellek) alınamadı (${selectedCrypto.api_id}).`);
+                 throw new Error(`Anlık kur bilgisi (Veritabanı Önbellek) alınamadı (${selectedCrypto.api_id}).`);
             }
             const rate = allRates[selectedCrypto.api_id].try;
-            // /YENİ
             
             if (!rate || rate <= 0) {
                 throw new Error('Anlık kur bilgisi alınamadı.');
             }
             const totalCryptoAmount = (product.price_tl * numQuantity) / rate;
-            // Kripto miktarını 6 ondalık basamakla sınırla (checkout.ejs'deki gibi)
             calculatedPaymentInfo = `${totalCryptoAmount.toFixed(6)} ${selectedCrypto.symbol}`; 
         } catch (apiError) {
             console.error("!!! FİYAT HESAPLAMA HATASI (POST /checkout):", apiError.message);
@@ -200,12 +200,12 @@ router.post('/checkout', verifyToken, async (req, res) => {
             orderNumber: orderNumber,
             productName: product.name,
             quantity: numQuantity,
-            paymentInfo: calculatedPaymentInfo, // GÜVENLİ: Sunucuda hesaplanan fiyat kullanıldı
+            paymentInfo: calculatedPaymentInfo,
             messages: initialMessages,
             status: 'Beklemede',
             isArchived: false,
             hasUnreadUserMessage: initialMessages.length > 0,
-            transactionId: transactionId.trim() // TxID kaydediliyor
+            transactionId: transactionId.trim()
         });
         const savedOrder = await newOrder.save();
         console.log("    Sipariş kaydedildi. No:", savedOrder.orderNumber);
@@ -226,7 +226,7 @@ router.get('/api/track-order/:orderNumber', verifyToken, async (req, res) => {
         const { orderNumber } = req.params;
         if (!orderNumber || !orderNumber.startsWith('EM-')) { throw new Error('Geçersiz sipariş numarası formatı.'); }
         const order = await Order.findOne({ orderNumber: orderNumber.trim().toUpperCase() }).lean();
-        if (!order) { return res.status(4404).json({ success: false, message: 'Sipariş bulunamadı.' }); }
+        if (!order) { return res.status(404).json({ success: false, message: 'Sipariş bulunamadı.' }); }
         
         // (Diğer isteğinizden gelen 15dk mesaj filtresi)
         const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
