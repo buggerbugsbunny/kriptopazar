@@ -16,8 +16,8 @@ let priceCache = {
     rates: null, // CoinGecko'dan gelen ham 'rates' objesini saklar (api_id bazlı)
     lastFetched: 0
 };
-// Fiyatları 1 dakika (60 saniye) boyunca önbellekte tut
-const CACHE_DURATION_MS = 60 * 1000; 
+// Fiyatları 5 dakika (300 saniye) boyunca önbellekte tut (GÜNCELLENDİ)
+const CACHE_DURATION_MS = 5 * 60 * 1000; 
 
 // Fiyatları getiren/önbellekten çeken yardımcı fonksiyon
 async function getFreshPrices() {
@@ -46,7 +46,9 @@ async function getFreshPrices() {
         return priceCache.rates;
 
     } catch (err) {
+        // Hata mesajını logla (zaten yapılıyor)
         console.error("!!! Fiyat çekme (getFreshPrices) hatası:", err.message);
+        
         // Hata durumunda, eski önbellek varsa onu kullanarak sitenin çökmesini engelle
         if (priceCache.rates) {
             console.warn("   -> Fiyat çekilemedi, eski (stale) önbellek sunuluyor.");
@@ -224,16 +226,15 @@ router.get('/api/track-order/:orderNumber', verifyToken, async (req, res) => {
         const { orderNumber } = req.params;
         if (!orderNumber || !orderNumber.startsWith('EM-')) { throw new Error('Geçersiz sipariş numarası formatı.'); }
         const order = await Order.findOne({ orderNumber: orderNumber.trim().toUpperCase() }).lean();
-        if (!order) { return res.status(404).json({ success: false, message: 'Sipariş bulunamadı.' }); }
+        if (!order) { return res.status(4404).json({ success: false, message: 'Sipariş bulunamadı.' }); }
         
-        // ****** 2. İSTEĞİNİZE GÖRE EKLENEN KOD (İsteğe bağlı, 3. istek için zorunlu değil) ******
+        // (Diğer isteğinizden gelen 15dk mesaj filtresi)
         const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
         if (order.messages && Array.isArray(order.messages)) {
             order.messages = order.messages.filter(msg => {
                 return new Date(msg.timestamp) > fifteenMinutesAgo;
             });
         }
-        // ****** /KOD SONU ******
         
         res.json({ success: true, order: order });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
