@@ -32,6 +32,17 @@ if (!process.env.SESSION_SECRET || !process.env.MONGO_URI) {
     console.error("HATA: .env dosyasında SESSION_SECRET veya MONGO_URI eksik!");
     process.exit(1);
 }
+
+// ****** YENİ EKLENEN KOD (SENARYO 2) ******
+// Sunucu bir reverse proxy (Nginx, Heroku, Cloudflare vb.) arkasındaysa
+// ve NODE_ENV=production ise, 'secure: true' cookie'sinin
+// HTTPS üzerinden (proxy aracılığıyla) çalışması için bu gereklidir.
+if (process.env.NODE_ENV === 'production') {
+    app.set('trust proxy', 1); // 1, tek bir proxy katmanına güven demektir.
+    console.log("UYGULAMA: 'trust proxy' production modu için etkinleştirildi.");
+}
+// ****** /YENİ EKLENEN KOD ******
+
 app.use(session({
     secret: process.env.SESSION_SECRET,
     resave: false,
@@ -44,6 +55,8 @@ app.use(session({
     cookie: {
         maxAge: 1000 * 60 * 60 * 3, // 3 saat
         httpOnly: true,
+        // 'trust proxy' ayarı sayesinde, secure: true artık
+        // X-Forwarded-Proto header'ını (https) dikkate alacaktır.
         secure: process.env.NODE_ENV === 'production'
     }
 }));
