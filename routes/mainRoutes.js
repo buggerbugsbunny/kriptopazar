@@ -11,6 +11,54 @@ const Crypto = require('../models/Crypto');
 const Order = require('../models/Order');
 const adminBot = require('../adminBot');
 
+// ****** YENİ EKLENDİ (Sunucu Taraflı Fiyat Önbelleği) ******
+let priceCache = {
+    rates: null, // CoinGecko'dan gelen ham 'rates' objesini saklar (api_id bazlı)
+    lastFetched: 0
+};
+// Fiyatları 1 dakika (60 saniye) boyunca önbellekte tut
+const CACHE_DURATION_MS = 60 * 1000; 
+
+// Fiyatları getiren/önbellekten çeken yardımcı fonksiyon
+async function getFreshPrices() {
+    const now = Date.now();
+    
+    // 1. Önbellek geçerliyse, önbellekten dön
+    if (priceCache.rates && (now - priceCache.lastFetched < CACHE_DURATION_MS)) {
+        console.log("... Fiyatlar (getFreshPrices) önbellekten alındı.");
+        return priceCache.rates;
+    }
+
+    // 2. Önbellek geçerli değilse, CoinGecko'dan çek
+    console.log("... Fiyatlar (getFreshPrices) CoinGecko'dan çekiliyor.");
+    try {
+        const cryptos = await Crypto.find().lean();
+        if (!cryptos || cryptos.length === 0) {
+             priceCache = { rates: {}, lastFetched: now };
+             return priceCache.rates;
+        }
+        
+        const apiIds = cryptos.map(c => c.api_id).join(',');
+        const response = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${apiIds}&vs_currencies=try`);
+        
+        // Ham 'rates' objesini (api_id bazlı) önbelleğe al
+        priceCache = { rates: response.data, lastFetched: now };
+        return priceCache.rates;
+
+    } catch (err) {
+        console.error("!!! Fiyat çekme (getFreshPrices) hatası:", err.message);
+        // Hata durumunda, eski önbellek varsa onu kullanarak sitenin çökmesini engelle
+        if (priceCache.rates) {
+            console.warn("   -> Fiyat çekilemedi, eski (stale) önbellek sunuluyor.");
+            return priceCache.rates; 
+        }
+        // İlk açılışta hata olursa boş obje döndür
+        return {};
+    }
+}
+// ****** /YENİ EKLENDİ ******
+
+
 const verifyToken = (req, res, next) => {
     const token = req.query.token;
     if (!token) { return res.redirect('/'); }
@@ -25,20 +73,30 @@ const verifyToken = (req, res, next) => {
 
 router.get('/', (req, res) => { res.render('index'); });
 
+// ****** GÜNCELLENDİ (Önbellek Kullanımı) ******
 router.get('/api/prices', verifyToken, async (req, res) => {
     try {
-        const cryptos = await Crypto.find().lean();
-        if (!cryptos || cryptos.length === 0) { return res.json({}); }
-        const apiIds = cryptos.map(c => c.api_id).join(',');
-        const response = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${apiIds}&vs_currencies=try`);
-        const rates = response.data;
+        // 1. Önbellekli yardımcı fonksiyondan ham 'rates' (api_id bazlı) verisini al
+        const rates = await getFreshPrices(); 
+
+        // 2. 'rates' verisini 'symbol' bazlı 'priceMap'e dönüştür (shop.ejs'nin beklediği format)
+        // (Bu DB çağrısı hızlıdır, API çağrısından kaçınmak daha önemlidir)
+        const cryptos = await Crypto.find().lean(); 
         const priceMap = {};
+        
         cryptos.forEach(crypto => {
-            if (rates[crypto.api_id] && rates[crypto.api_id].try) { priceMap[crypto.symbol] = rates[crypto.api_id].try; }
+            if (rates[crypto.api_id] && rates[crypto.api_id].try) {
+                priceMap[crypto.symbol] = rates[crypto.api_id].try;
+            }
         });
+        
         res.json(priceMap);
-    } catch (err) { console.error("!!! /api/prices HATASI:", err.message); res.status(500).json({ error: 'Fiyatlar alınamadı.' }); }
+    } catch (err) { 
+        console.error("!!! /api/prices HATASI:", err.message); 
+        res.status(500).json({ error: 'Fiyatlar alınamadı.' }); 
+    }
 });
+// ****** /GÜNCELLENDİ ******
 
 router.get('/shop', verifyToken, async (req, res) => {
     try {
@@ -69,7 +127,7 @@ router.get('/checkout', verifyToken, async (req, res) => {
     }
 });
 
-// ****** GÜNCELLENDİ (POST /checkout) ******
+// ****** GÜNCELLENDİ (POST /checkout - Önbellek Kullanımı) ******
 router.post('/checkout', verifyToken, async (req, res) => {
     console.log("--- POST /checkout isteği alındı:", req.body);
     try {
@@ -98,11 +156,21 @@ router.post('/checkout', verifyToken, async (req, res) => {
             return res.status(400).json({ success: false, message: 'Bu ödeme yöntemi bu ürün için geçerli değil.' }); 
         }
 
-        // --- GÜVENLİK İYİLEŞTİRMESİ: Sunucu Tarafında Fiyat Hesaplama ---
+        // --- GÜVENLİK İYİLEŞTİRMESİ: Sunucu Tarafında Fiyat Hesaplama (Önbellekli) ---
         let calculatedPaymentInfo;
         try {
-            const response = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${selectedCrypto.api_id}&vs_currencies=try`);
-            const rate = response.data[selectedCrypto.api_id].try;
+            // ESKİ axios.get KULLANIMI KALDIRILDI
+            // const response = await axios.get(`...`);
+            
+            // YENİ: Önbellekli yardımcı fonksiyondan ham 'rates' (api_id bazlı) verisini al
+            const allRates = await getFreshPrices();
+            
+            if (!allRates[selectedCrypto.api_id] || !allRates[selectedCrypto.api_id].try) {
+                 throw new Error(`Anlık kur bilgisi (Önbellek) alınamadı (${selectedCrypto.api_id}).`);
+            }
+            const rate = allRates[selectedCrypto.api_id].try;
+            // /YENİ
+            
             if (!rate || rate <= 0) {
                 throw new Error('Anlık kur bilgisi alınamadı.');
             }
@@ -157,6 +225,16 @@ router.get('/api/track-order/:orderNumber', verifyToken, async (req, res) => {
         if (!orderNumber || !orderNumber.startsWith('EM-')) { throw new Error('Geçersiz sipariş numarası formatı.'); }
         const order = await Order.findOne({ orderNumber: orderNumber.trim().toUpperCase() }).lean();
         if (!order) { return res.status(404).json({ success: false, message: 'Sipariş bulunamadı.' }); }
+        
+        // ****** 2. İSTEĞİNİZE GÖRE EKLENEN KOD (İsteğe bağlı, 3. istek için zorunlu değil) ******
+        const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
+        if (order.messages && Array.isArray(order.messages)) {
+            order.messages = order.messages.filter(msg => {
+                return new Date(msg.timestamp) > fifteenMinutesAgo;
+            });
+        }
+        // ****** /KOD SONU ******
+        
         res.json({ success: true, order: order });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 });
