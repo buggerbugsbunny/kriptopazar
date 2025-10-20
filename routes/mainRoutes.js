@@ -12,10 +12,10 @@ const Order = require('../models/Order');
 const adminBot = require('../adminBot');
 
 // ****** YENİ EKLENDİ (Kalıcı Veritabanı Önbelleği) ******
-const PriceCache = require('../models/PriceCache'); // Yeni modeli import et
+const PriceCache = require('../models/PriceCache'); // Modeli import et
 
-// Fiyatları 10 dakika boyunca veritabanı önbelleğinde tut
-const DB_CACHE_DURATION_MS = 10 * 60 * 1000; 
+// Fiyatları 2 SAAT (120 dakika) boyunca veritabanı önbelleğinde tut (GÜNCELLENDİ)
+const DB_CACHE_DURATION_MS = 120 * 60 * 1000; 
 
 // Fiyatları getiren/önbellekten çeken YENİ yardımcı fonksiyon
 async function getFreshPrices() {
@@ -26,17 +26,18 @@ async function getFreshPrices() {
         // 1. Önbelleği veritabanından kontrol et
         const cache = await PriceCache.findById(cacheId);
 
-        // 2. Önbellek varsa VE 10 dakikadan yeniyse, veritabanından dön
+        // 2. Önbellek varsa VE 2 saatten yeniyse, veritabanından dön
         if (cache && (now - new Date(cache.updatedAt).getTime() < DB_CACHE_DURATION_MS)) {
             console.log("... Fiyatlar (getFreshPrices) Veritabanı Önbelleğinden alındı.");
             return cache.rates; // Kayıtlı 'rates' objesini döndür
         }
 
-        // 3. Önbellek yoksa VEYA 10 dakikadan eskiyse, CoinGecko'dan çek
+        // 3. Önbellek yoksa VEYA 2 saatten eskiyse, CoinGecko'dan çek
         console.log("... Fiyatlar (getFreshPrices) CoinGecko'dan çekiliyor (Veritabanı güncellenecek).");
         
         const cryptos = await Crypto.find().lean();
         if (!cryptos || cryptos.length === 0) {
+             console.log("... Çekilecek kripto (Crypto) bulunamadı. Boş dönülüyor.");
              return {}; // Çekilecek kripto yoksa boş dön
         }
         
